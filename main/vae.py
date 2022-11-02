@@ -201,7 +201,13 @@ def cross_replica_mean(batch_stats):
     return jax.lax.pmean(batch_stats, "batch")
 
 
-def save(images: np.ndarray, flow_location: Optional[str], plot_every: int, title: str, identifier: str):
+def save(
+    images: np.ndarray,
+    flow_location: Optional[str],
+    plot_every: int,
+    title: str,
+    identifier: str,
+):
     npy_name = Path(f"results/npy/{identifier}_{flow_location}.npy")
     npy_name.parent.mkdir(parents=True, exist_ok=True)
     np.save(npy_name, images)
@@ -222,7 +228,10 @@ def save(images: np.ndarray, flow_location: Optional[str], plot_every: int, titl
             ax.imshow(image.reshape(32, 32), cmap="gray")
             if col == 0:
                 ax.set_ylabel(
-                    f"Epc {row + 1}", rotation="horizontal", ha="right", va="center"
+                    f"{(row + 1) * plot_every - 1}",
+                    rotation="horizontal",
+                    ha="right",
+                    va="center",
                 )
             ax.set_xticks([])
             ax.set_yticks([])
@@ -263,10 +272,10 @@ def fit_vae(
     )
     state = flax.jax_utils.replicate(state)
 
-    row_shape = (device_count, *specimen.shape[1:-1])
-    orig_images = np.empty((target_epoch, *row_shape))
-    recon_images = np.empty((target_epoch, *row_shape))
-    generated_images = np.empty((target_epoch, *row_shape))
+    images_shape = (device_count, device_count, *specimen.shape[1:-1])
+    orig_images = np.zeros(images_shape)
+    recon_images = np.zeros(images_shape)
+    generated_images = np.zeros(images_shape)
 
     plot_every = target_epoch // device_count
     for epoch in range(target_epoch):
@@ -278,7 +287,7 @@ def fit_vae(
             state, loss, recon = train_step(state, key_Z, image)
             elbo_epoch += -flax.jax_utils.unreplicate(loss)
 
-            if epoch % plot_every == 0:
+            if (epoch + 1) % plot_every == 0:
                 orig_images[epoch // plot_every] = image[:, -1, ..., 0]
                 recon_images[epoch // plot_every] = recon[:, -1, ..., 0]
 
@@ -290,11 +299,13 @@ def fit_vae(
         key, key_Z = jax.random.split(key)
         Z = jax.random.normal(key_Z, (device_count, latent_dim))
         generated_image = decode(state, Z)
-        generated_images[epoch] = generated_image.reshape(row_shape)
+        generated_images[epoch // plot_every] = generated_image.reshape(
+            images_shape[1:]
+        )
 
-        save(orig_images, flow_location, plot_every, "Original", "orig")
-        save(recon_images, flow_location, plot_every, "Reconstructed", "recon")
-        save(generated_images, flow_location, plot_every, "Generated", "gen")
+    save(orig_images, flow_location, plot_every, "Original", "orig")
+    save(recon_images, flow_location, plot_every, "Reconstructed", "recon")
+    save(generated_images, flow_location, plot_every, "Generated", "gen")
 
 
 if __name__ == "__main__":
@@ -306,7 +317,7 @@ if __name__ == "__main__":
     flow_hidden_dims = (512, 512)
     flow_num_bins = 4
 
-    target_epoch = 16
+    target_epoch = 24
     batch_size = 256
     learning_rate = 1e-3
 
