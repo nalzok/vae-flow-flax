@@ -10,7 +10,10 @@ import distrax
 
 
 def make_conditioner(
-    event_shape: Sequence[int], hidden_sizes: Sequence[int], num_bijector_params: int
+    event_shape: Sequence[int],
+    hidden_sizes: Sequence[int],
+    num_bijector_params: int,
+    suffix: int,
 ) -> nn.Module:
     """Creates an MLP conditioner for each layer of the flow."""
     layers: List[Callable[..., Any]] = [
@@ -40,7 +43,7 @@ def make_conditioner(
         )
     )
 
-    return nn.Sequential(layers)
+    return nn.Sequential(layers, name=f"conditioner_{suffix}")
 
 
 class Flow(nn.Module):
@@ -68,8 +71,8 @@ class Flow(nn.Module):
         num_bijector_params = 3 * self.num_bins + 1
 
         self.conditioners = [
-            make_conditioner(event_shape, self.hidden_dims, num_bijector_params)
-            for _ in range(self.num_coupling_layers)
+            make_conditioner(event_shape, self.hidden_dims, num_bijector_params, suffix)
+            for suffix in range(self.num_coupling_layers)
         ]
 
         layers = []
