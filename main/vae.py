@@ -70,22 +70,6 @@ class Decoder(nn.Module):
 
 
 class VAE(nn.Module):
-    # Flow prior
-    #
-    #   X --encoder--> Z --decoder--> recon <=> X
-    #                  ^
-    #                  |
-    #                flow
-    #                  |
-    #               epsilon
-    #
-    # Flow posterior
-    #
-    #   X --encoder--> Z --flow--> Z_k --decoder--> recon <=> X
-    #                               ^
-    #                               |
-    #                            epsilon
-
     beta: float
     latent_dim: int
     hidden_dims: Sequence[int]
@@ -217,7 +201,7 @@ def cross_replica_mean(batch_stats):
     return jax.lax.pmean(batch_stats, "batch")
 
 
-def save(images: np.ndarray, flow_location: Optional[str], title: str, identifier: str):
+def save(images: np.ndarray, flow_location: Optional[str], plot_every: int, title: str, identifier: str):
     npy_name = Path(f"results/npy/{identifier}_{flow_location}.npy")
     npy_name.parent.mkdir(parents=True, exist_ok=True)
     np.save(npy_name, images)
@@ -228,6 +212,7 @@ def save(images: np.ndarray, flow_location: Optional[str], title: str, identifie
     png_name.parent.mkdir(parents=True, exist_ok=True)
 
     nrows, ncols, *_ = images.shape
+    plt.box(False)
     fig, axes = plt.subplots(
         nrows, ncols, constrained_layout=True, figsize=plt.figaspect(1)
     )
@@ -236,7 +221,9 @@ def save(images: np.ndarray, flow_location: Optional[str], title: str, identifie
             ax = axes[row, col]
             ax.imshow(image.reshape(32, 32), cmap="gray")
             if col == 0:
-                ax.set_ylabel(f"epc {row}")
+                ax.set_ylabel(
+                    f"Epc {row + 1}", rotation="horizontal", ha="right", va="center"
+                )
             ax.set_xticks([])
             ax.set_yticks([])
 
@@ -281,6 +268,7 @@ def fit_vae(
     recon_images = np.empty((target_epoch, *row_shape))
     generated_images = np.empty((target_epoch, *row_shape))
 
+    plot_every = target_epoch // device_count
     for epoch in range(target_epoch):
         elbo_epoch = 0
         for X, _ in loader:
@@ -290,8 +278,9 @@ def fit_vae(
             state, loss, recon = train_step(state, key_Z, image)
             elbo_epoch += -flax.jax_utils.unreplicate(loss)
 
-            orig_images[epoch] = image[:, -1, ..., 0]
-            recon_images[epoch] = recon[:, -1, ..., 0]
+            if epoch % plot_every == 0:
+                orig_images[epoch // plot_every] = image[:, -1, ..., 0]
+                recon_images[epoch // plot_every] = recon[:, -1, ..., 0]
 
         # Sync the batch statistics across replicas so that evaluation is deterministic.
         state = state.replace(batch_stats=cross_replica_mean(state.batch_stats))
@@ -303,9 +292,9 @@ def fit_vae(
         generated_image = decode(state, Z)
         generated_images[epoch] = generated_image.reshape(row_shape)
 
-        save(orig_images, flow_location, "Original", "orig")
-        save(recon_images, flow_location, "Reconstructed", "recon")
-        save(generated_images, flow_location, "Generated", "gen")
+        save(orig_images, flow_location, plot_every, "Original", "orig")
+        save(recon_images, flow_location, plot_every, "Reconstructed", "recon")
+        save(generated_images, flow_location, plot_every, "Generated", "gen")
 
 
 if __name__ == "__main__":
@@ -317,11 +306,13 @@ if __name__ == "__main__":
     flow_hidden_dims = (512, 512)
     flow_num_bins = 4
 
-    target_epoch = 8
+    target_epoch = 16
     batch_size = 256
     learning_rate = 1e-3
 
     device_count = jax.local_device_count()
+    if target_epoch % device_count != 0:
+        raise ValueError(f"target_epoch should be divisible by {device_count}")
     if batch_size % device_count != 0:
         raise ValueError(f"batch_size should be divisible by {device_count}")
 
