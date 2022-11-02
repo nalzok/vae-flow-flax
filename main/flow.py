@@ -14,7 +14,7 @@ def make_conditioner(
 ) -> nn.Module:
     """Creates an MLP conditioner for each layer of the flow."""
     layers: List[Callable[..., Any]] = [
-        lambda x: x.reshape((-1, *x.shape[-len(event_shape) :]))
+        lambda X: X.reshape((-1, *X.shape[-len(event_shape) :]))
     ]
 
     for hidden_size in hidden_sizes:
@@ -31,9 +31,9 @@ def make_conditioner(
         )
     )
     layers.append(
-        lambda x: x.reshape(
+        lambda X: X.reshape(
             (
-                *x.shape[:-3],
+                *X.shape[:-1],
                 *event_shape,
                 num_bijector_params,
             )
@@ -67,25 +67,28 @@ class Flow(nn.Module):
         # for a total of `3 * num_bins + 1` parameters.
         num_bijector_params = 3 * self.num_bins + 1
 
+        self.conditioners = [
+            make_conditioner(event_shape, self.hidden_dims, num_bijector_params)
+            for _ in range(self.num_coupling_layers)
+        ]
+
         layers = []
-        for _ in range(self.num_coupling_layers):
+        for conditioner in self.conditioners:
             layer = distrax.MaskedCoupling(
                 mask=mask,
                 bijector=bijector_fn,
-                conditioner=make_conditioner(
-                    event_shape, self.hidden_dims, num_bijector_params
-                ),
+                conditioner=conditioner,
             )
             layers.append(layer)
             # Flip the mask after each layer.
             mask = jnp.logical_not(mask)
 
-        self.flow: distrax.Bijector = distrax.Chain(layers)
+        self.bijector: distrax.Bijector = distrax.Chain(layers)
 
     def __call__(self, X):
         if len(X.shape) == 0:
             X = X[jnp.newaxis, ...]
-        return self.flow.forward(X)
+        return self.bijector.forward(X)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
-from typing import Tuple, Sequence
+from typing import Tuple, Sequence, Optional
 from functools import partial
+from pathlib import Path
 
 import numpy as np
 import jax
@@ -9,6 +10,11 @@ import flax.linen as nn
 from flax.training import train_state
 import distrax
 import optax
+from torch import Generator
+from torch.utils.data import DataLoader
+import torchvision.transforms as T
+from torchvision.datasets import MNIST
+from matplotlib import pyplot as plt
 
 from .flow import Flow
 
@@ -37,7 +43,7 @@ class Decoder(nn.Module):
 
     @nn.compact
     def __call__(self, X, training):
-        H, W, C = self.output_dim
+        *_, H, W, C = self.output_dim
 
         # TODO: relax this restriction
         factor = 2 ** len(self.hidden_dims)
@@ -63,12 +69,6 @@ class Decoder(nn.Module):
         return X
 
 
-def reparameterize(key, mean, logvar):
-    std = jnp.exp(0.5 * logvar)
-    eps = jax.random.normal(key, logvar.shape)
-    return mean + eps * std
-
-
 class VAE(nn.Module):
     # Flow prior
     #
@@ -91,11 +91,15 @@ class VAE(nn.Module):
     hidden_dims: Sequence[int]
     output_dim: Tuple[int, int, int]
 
-    flow_prior: bool
+    flow_location: Optional[str]
     flow_num_coupling_layers: int
+    flow_hidden_dims: Sequence[int]
     flow_num_bins: int
 
     def setup(self):
+        if self.flow_location not in (None, "posterior", "prior"):
+            raise ValueError(f"Unknown flow location {self.flow_location}")
+
         self.encoder = Encoder(self.latent_dim, self.hidden_dims)
         self.decoder = Decoder(self.output_dim, self.hidden_dims)
         self.epsilon = distrax.MultivariateNormalDiag(
@@ -103,13 +107,12 @@ class VAE(nn.Module):
         )
         self.flow = Flow(
             self.latent_dim,
-            self.hidden_dims,
+            self.flow_hidden_dims,
             self.flow_num_coupling_layers,
             self.flow_num_bins,
         )
-        self.flow.setup()  # FIXME: why is this needed?
-        if self.flow_prior:
-            self.prior = distrax.Transformed(self.epsilon, self.flow)
+        if self.flow_location == "prior":
+            self.prior = distrax.Transformed(self.epsilon, self.flow.bijector)
         else:
             self.prior = self.epsilon
 
@@ -118,22 +121,23 @@ class VAE(nn.Module):
         posterior = distrax.MultivariateNormalDiag(
             loc=mean, scale_diag=jnp.exp(0.5 * logvar)
         )
-        Z = reparameterize(key, mean, logvar)
 
-        if not self.flow_prior:
-            posterior = distrax.Transformed(posterior, self.flow)
-            Z = self.flow.forward(Z)
+        if self.flow_location == "posterior":
+            posterior = distrax.Transformed(posterior, self.flow.bijector)
+
+        Z, posterior_log_prob = posterior.sample_and_log_prob(seed=key, sample_shape=())
 
         recon = self.decoder(Z, training)
 
-        likelihood = self.beta * jnp.mean((recon - X) ** 2)
-        kl_divergence = -(self.prior.log_prob(Z) - posterior.log_prob(Z))
+        log_prob = -self.beta * jnp.sum((recon - X) ** 2)
+        kl_divergence = -(self.prior.log_prob(Z) - posterior_log_prob)
+        elbo = log_prob - kl_divergence
 
-        return likelihood - kl_divergence
+        return elbo, recon
 
     def decode(self, epsilon, training):
-        if self.flow_prior:
-            Z = self.flow.forward(epsilon)
+        if self.flow_location == "prior":
+            Z = self.flow(epsilon)
         else:
             Z = epsilon
 
@@ -150,8 +154,9 @@ def create_train_state(
     latent_dim: int,
     hidden_dims: Sequence[int],
     specimen: jnp.ndarray,
-    flow_prior: bool,
+    flow_location: Optional[str],
     flow_num_coupling_layers: int,
+    flow_hidden_dims: Sequence[int],
     flow_num_bins: int,
     learning_rate: float,
 ):
@@ -160,8 +165,9 @@ def create_train_state(
         latent_dim,
         hidden_dims,
         specimen.shape,
-        flow_prior,
+        flow_location,
         flow_num_coupling_layers,
+        flow_hidden_dims,
         flow_num_bins,
     )
     key_dummy = jax.random.PRNGKey(42)
@@ -177,26 +183,28 @@ def create_train_state(
     return state
 
 
-@jax.jit
+@partial(jax.pmap, axis_name="batch", donate_argnums=(0,))
 def train_step(state, key, image):
     @partial(jax.value_and_grad, has_aux=True)
     def loss_fn(params):
         variables = {"params": params, "batch_stats": state.batch_stats}
-        elbo, new_model_state = state.apply_fn(
+        (elbo, recon), new_model_state = state.apply_fn(
             variables, key, image, True, mutable=["batch_stats"]
         )
-        return -elbo.sum(), new_model_state
+        return -elbo.sum(), (new_model_state, recon)
 
-    (loss, new_model_state), grads = loss_fn(state.params)
+    (loss, (new_model_state, recon)), grads = loss_fn(state.params)
+    loss = jax.lax.psum(loss, axis_name="batch")
+    grads = jax.lax.psum(grads, axis_name="batch")
 
     state = state.apply_gradients(
         grads=grads, batch_stats=new_model_state["batch_stats"]
     )
 
-    return state, loss
+    return state, loss, recon
 
 
-@jax.jit
+@jax.pmap
 def decode(state, Z):
     variables = {"params": state.params, "batch_stats": state.batch_stats}
     decoded = state.apply_fn(variables, Z, False, method=VAE.decode)
@@ -204,31 +212,55 @@ def decode(state, Z):
     return decoded
 
 
-def mnist_demo():
-    from torch import Generator
-    from torch.utils.data import DataLoader
-    import torchvision.transforms as T
-    from torchvision.datasets import MNIST
+@partial(jax.pmap, axis_name="batch", donate_argnums=(0,))
+def cross_replica_mean(batch_stats):
+    return jax.lax.pmean(batch_stats, "batch")
 
-    beta = 1
-    latent_dim = 20
-    hidden_dims = (32, 64, 128, 256, 512)
-    specimen = jnp.empty((1, 32, 32, 1))
-    flow_prior = True
-    flow_num_coupling_layers = 8
-    flow_num_bins = 4
 
-    target_epoch = 2
-    batch_size = 256
-    lr = 1e-3
+def save(images: np.ndarray, flow_location: Optional[str], title: str, identifier: str):
+    npy_name = Path(f"results/npy/{identifier}_{flow_location}.npy")
+    npy_name.parent.mkdir(parents=True, exist_ok=True)
+    np.save(npy_name, images)
 
-    transform = T.Compose([T.Resize((32, 32)), T.ToTensor()])
-    mnist_train = MNIST(
-        "/tmp/torchvision", train=True, download=True, transform=transform
+    pdf_name = Path(f"results/pdf/{identifier}_{flow_location}.pdf")
+    png_name = Path(f"results/png/{identifier}_{flow_location}.png")
+    pdf_name.parent.mkdir(parents=True, exist_ok=True)
+    png_name.parent.mkdir(parents=True, exist_ok=True)
+
+    nrows, ncols, *_ = images.shape
+    fig, axes = plt.subplots(
+        nrows, ncols, constrained_layout=True, figsize=plt.figaspect(1)
     )
-    generator = Generator().manual_seed(42)
-    loader = DataLoader(mnist_train, batch_size, shuffle=True, generator=generator)
+    for row, images_row in enumerate(images):
+        for col, image in enumerate(images_row):
+            ax = axes[row, col]
+            ax.imshow(image.reshape(32, 32), cmap="gray")
+            if col == 0:
+                ax.set_ylabel(f"epc {row}")
+            ax.set_xticks([])
+            ax.set_yticks([])
 
+    fig.suptitle(f"{title} ({flow_location})", fontsize="xx-large")
+    plt.savefig(pdf_name)
+    plt.savefig(png_name)
+    plt.close()
+
+
+def fit_vae(
+    beta: float,
+    latent_dim: int,
+    hidden_dims: Sequence[int],
+    specimen: jnp.ndarray,
+    flow_location: Optional[str],
+    flow_num_coupling_layers: int,
+    flow_hidden_dims: Sequence[int],
+    flow_num_bins: int,
+    target_epoch: int,
+    batch_size: int,
+    learning_rate: float,
+    device_count: int,
+    loader: DataLoader,
+):
     key = jax.random.PRNGKey(42)
     state = create_train_state(
         key,
@@ -236,22 +268,84 @@ def mnist_demo():
         latent_dim,
         hidden_dims,
         specimen,
-        flow_prior,
+        flow_location,
         flow_num_coupling_layers,
+        flow_hidden_dims,
         flow_num_bins,
-        lr,
+        learning_rate,
     )
+    state = flax.jax_utils.replicate(state)
+
+    row_shape = (device_count, *specimen.shape[1:-1])
+    orig_images = np.empty((target_epoch, *row_shape))
+    recon_images = np.empty((target_epoch, *row_shape))
+    generated_images = np.empty((target_epoch, *row_shape))
 
     for epoch in range(target_epoch):
-        loss_train = 0
+        elbo_epoch = 0
         for X, _ in loader:
-            image = jnp.array(X).reshape((-1, *specimen.shape))
-            key, key_Z = jax.random.split(key)
-            state, loss = train_step(state, key_Z, image)
-            loss_train += loss
+            image = jnp.array(X).reshape((device_count, -1, *specimen.shape[1:]))
+            key, *key_Z = jax.random.split(key, device_count + 1)
+            key_Z = jnp.array(key_Z)
+            state, loss, recon = train_step(state, key_Z, image)
+            elbo_epoch += -flax.jax_utils.unreplicate(loss)
 
-        print(f"Epoch {epoch + 1}: train loss {loss_train}")
+            orig_images[epoch] = image[:, -1, ..., 0]
+            recon_images[epoch] = recon[:, -1, ..., 0]
+
+        # Sync the batch statistics across replicas so that evaluation is deterministic.
+        state = state.replace(batch_stats=cross_replica_mean(state.batch_stats))
+
+        print(f"Epoch {epoch + 1}: ELBO {elbo_epoch / batch_size}")
+
+        key, key_Z = jax.random.split(key)
+        Z = jax.random.normal(key_Z, (device_count, latent_dim))
+        generated_image = decode(state, Z)
+        generated_images[epoch] = generated_image.reshape(row_shape)
+
+        save(orig_images, flow_location, "Original", "orig")
+        save(recon_images, flow_location, "Reconstructed", "recon")
+        save(generated_images, flow_location, "Generated", "gen")
 
 
 if __name__ == "__main__":
-    mnist_demo()
+    beta = 1
+    latent_dim = 20
+    hidden_dims = (32, 64, 128, 256, 512)
+    specimen = jnp.empty((1, 32, 32, 1))
+    flow_num_coupling_layers = 8
+    flow_hidden_dims = (512, 512)
+    flow_num_bins = 4
+
+    target_epoch = 8
+    batch_size = 256
+    learning_rate = 1e-3
+
+    device_count = jax.local_device_count()
+    if batch_size % device_count != 0:
+        raise ValueError(f"batch_size should be divisible by {device_count}")
+
+    transform = T.Compose([T.Resize(specimen.shape[1:-1]), T.ToTensor()])
+    mnist_train = MNIST(
+        "/tmp/torchvision", train=True, download=True, transform=transform
+    )
+    generator = Generator().manual_seed(42)
+    loader = DataLoader(mnist_train, batch_size, shuffle=True, generator=generator)
+
+    for flow_location in (None, "prior", "posterior"):
+        print(f"{flow_location = }")
+        fit_vae(
+            beta,
+            latent_dim,
+            hidden_dims,
+            specimen,
+            flow_location,
+            flow_num_coupling_layers,
+            flow_hidden_dims,
+            flow_num_bins,
+            target_epoch,
+            batch_size,
+            learning_rate,
+            device_count,
+            loader,
+        )
