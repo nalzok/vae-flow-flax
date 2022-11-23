@@ -295,7 +295,6 @@ def fit_vae(
         state = state.replace(batch_stats=cross_replica_mean(state.batch_stats))
 
         print(f"Epoch {epoch + 1}: ELBO {elbo_epoch / batch_size}")
-        # print(jax.tree_util.tree_structure(flax.jax_utils.unreplicate(state)))
 
         key, key_Z = jax.random.split(key)
         Z = jax.random.normal(key_Z, (device_count, latent_dim))
@@ -314,13 +313,13 @@ if __name__ == "__main__":
     latent_dim = 20
     hidden_dims = (32, 64, 128, 256, 512)
     specimen = jnp.empty((1, 32, 32, 1))
-    flow_num_coupling_layers = 8
-    flow_hidden_dims = (512, 512)
-    flow_num_bins = 4
+    flow_num_coupling_layers = 32
+    flow_hidden_dims = (1024, 1024, 1024)
+    flow_num_bins = 16
 
-    target_epoch = 24
+    target_epoch = 512
     batch_size = 256
-    learning_rate = 1e-3
+    learning_rate = 1e-4
 
     device_count = jax.local_device_count()
     if target_epoch % device_count != 0:
